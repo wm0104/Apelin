@@ -742,14 +742,16 @@ extension ChatController {
             options: .displayInline,
             children: catalog.map { model in
                 let isOn = enabled.contains(model)
-                let action = UIAction(title: model, state: isOn ? .on : .off) { _ in
+                // The menu stays up while models are turned on and off
+                // (`UIMenuElement.Attributes.keepsMenuPresented`), and the
+                // one in use stays on.
+                var attributes: UIMenuElement.Attributes = [.keepsMenuPresented]
+                if model == inUse {
+                    attributes.insert(.disabled)
+                }
+                return UIAction(title: model, attributes: attributes, state: isOn ? .on : .off) { _ in
                     EnabledModels.setEnabled(!isOn, model, in: account)
                 }
-                // The menu stays up while models are turned on and off, and
-                // the one in use stays on.
-                action.keepsMenuPresented = true
-                action.attributes = model == inUse ? [.disabled] : []
-                return action
             },
         ))
         return UIMenu(title: menuTitle(of: account), options: .displayInline, children: sections)
