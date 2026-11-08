@@ -177,6 +177,31 @@ final class ChatRuntime {
         persist(id)
     }
 
+    /// `id` runs with `selection` from now on: the reader's pick for this
+    /// conversation, kept with it, and announced with its id so only that
+    /// conversation's page redraws.
+    func takeSelection(_ selection: ComposerModelSelection, for id: UUID) {
+        guard var record = records[id] else { return }
+        let unchanged = record.provider == selection.provider && record.model == selection.model
+            && record.supportedEfforts == selection.supportedEfforts
+            && record.supportedTiers == selection.supportedTiers
+        guard !unchanged else { return }
+        record.takeSelection(selection)
+        records[id] = record
+        changed(id)
+        NotificationCenter.default.post(name: .composerModelSelectionChanged, object: id)
+    }
+
+    /// Keeps the app's default as `id`'s own the first time it opens or
+    /// sends; one it has stays, whatever the default becomes later.
+    @discardableResult
+    private func pinSelection(for id: UUID) -> Bool {
+        guard var record = records[id], record.pinSelection(ComposerModelSelection.current) else { return false }
+        records[id] = record
+        persist(id)
+        return true
+    }
+
     @objc dynamic func togglePin(_ id: UUID) {
         records[id]?.summary.isPinned.toggle()
         changed(id)
@@ -395,7 +420,7 @@ final class ChatRuntime {
             ))
             descriptors.append(OwnedDescriptor(adopting: fd))
         }
-        let selection = ComposerModelSelection.current
+        let selection = records[id]?.selection ?? ComposerModelSelection.current
         _ = try await ApelinService.app.send(
             AgentPromptRequest(
                 sessionID: opened.sessionID,
@@ -484,7 +509,8 @@ final class ChatRuntime {
         if let sessionID = record.sessionID, let task = record.task, readers[id] != nil {
             return AgentOpenResponse(sessionID: sessionID, task: task)
         }
-        let selected = ComposerModelSelection.current
+        pinSelection(for: id)
+        let selected = records[id]?.selection ?? ComposerModelSelection.current
         let mode = AgentPermissions.mode
         let request = AgentOpenRequest(
             projectName: record.summary.projectName,

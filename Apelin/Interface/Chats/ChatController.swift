@@ -144,7 +144,7 @@ final class ChatController: UIViewController {
         composer.modelBar.onTierChanged = { ComposerModelPreferences.tier = $0 }
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(updateModelSelection),
+            selector: #selector(modelSelectionChanged(_:)),
             name: .composerModelSelectionChanged,
             object: nil,
         )
@@ -166,7 +166,7 @@ final class ChatController: UIViewController {
             name: UIApplication.didBecomeActiveNotification,
             object: nil,
         )
-        updateModelSelection()
+        showModelSelection()
         modelButton.showsMenuAsPrimaryAction = true
         modelButton.menu = UIMenu(children: [UIDeferredMenuElement.uncached { [weak self] completion in
             guard let self else { completion([]); return }
@@ -436,7 +436,7 @@ final class ChatController: UIViewController {
         let previous = self.chat
         self.chat = chat
         ConversationNotices.shared.withdraw(session: runtime.records[chat.id]?.sessionID)
-        updateModelSelection()
+        showModelSelection()
         ensureModelSelection()
         title = chat.displayTitle
         // rolled only on screen; a page coming back shows its name at once
@@ -607,11 +607,25 @@ final class ChatController: UIViewController {
         showApproval(chat?.isWorking == true ? items.first { $0.role.needsApproval } : nil)
     }
 
-    @objc dynamic private func updateModelSelection() {
-        let selection = ComposerModelSelection.current
+    /// Draws the model bar from the conversation's own pick, or the app's
+    /// default while it has none.
+    @objc dynamic private func showModelSelection() {
+        let selection = chat.flatMap { runtime.records[$0.id]?.selection } ?? ComposerModelSelection.current
         composer.modelBar.setModelName(selection?.model)
         composer.modelBar.setEfforts(selection?.supportedEfforts ?? [], selected: selection?.effort)
         composer.modelBar.setTiers(selection?.supportedTiers ?? [], selected: selection?.tier)
+    }
+
+    /// A conversation's pick is announced with its id, and redraws only that
+    /// conversation's page; the app's default (no id) shows only where the
+    /// conversation has not picked one of its own.
+    @objc dynamic private func modelSelectionChanged(_ note: Notification) {
+        if let id = note.object as? UUID {
+            guard id == chat?.id else { return }
+        } else if let chat, runtime.records[chat.id]?.hasOwnSelection == true {
+            return
+        }
+        showModelSelection()
     }
 
     /// A model disabled in Settings stops being the one the next message uses.
@@ -672,11 +686,43 @@ final class ChatController: UIViewController {
                 }
                 let catalogs = await Self.catalogs(for: accounts.map(\.provider))
                 guard !Task.isCancelled, self.chat?.id == chat.id else { completion([]); return }
-                let selected = ComposerModelSelection.current
+                let selected = self.runtime.records[chat.id]?.selection ?? ComposerModelSelection.current
                 let menus: [UIMenuElement] = accounts.map { account in
-                    Self.accountMenu(account, selected: selected, catalog: catalogs[account.provider])
+                    Self.accountMenu(
+                        account,
+                        selected: selected,
+                        catalog: catalogs[account.provider],
+                    ) { model in
+                        if !EnabledModels.isEnabled(model, in: account) {
+                            EnabledModels.setEnabled(true, model, in: account)
+                        }
+                        self.runtime.takeSelection(Self.selection(of: model, in: account), for: chat.id)
+                    }
                 }
-                completion(menus)
+                // The conversation's pick as the default for the ones that
+                // follow, and Settings' accounts page.
+                let managed = UIMenu(options: .displayInline, children: [
+                    UIAction(
+                        title: String(localized: "Set as Default for New Chats"),
+                        image: UIImage(systemName: "pin"),
+                    ) { [weak self] _ in
+                        guard let self else { return }
+                        // a conversation that has not picked one yet shows the
+                        // default already, so there is nothing to set
+                        guard let selection = self.runtime.records[chat.id]?.selection
+                            ?? ComposerModelSelection.current
+                        else { return }
+                        ComposerModelSelection.current = selection
+                    },
+                    UIAction(
+                        title: String(localized: "Manage Accounts…"),
+                        image: UIImage(systemName: "person.2"),
+                    ) { [weak self] _ in
+                        guard let self, presentedViewController == nil else { return }
+                        presentPageAsFormSheet(ModelProvidersController())
+                    },
+                ])
+                completion(menus + [managed])
             } catch {
                 completion([])
                 guard !Task.isCancelled, self.chat?.id == chat.id else { return }
@@ -714,6 +760,7 @@ extension ChatController {
         _ account: AgentAccount,
         selected: ComposerModelSelection?,
         catalog: [String]?,
+        select: @escaping (String) -> Void,
     ) -> UIMenu {
         let enabled = EnabledModels.enabled(in: account)
         let inUse = account.provider == selected?.provider ? selected?.model : nil
@@ -724,7 +771,7 @@ extension ChatController {
                 options: .displayInline,
                 children: enabled.map { model in
                     UIAction(title: model, state: model == inUse ? .on : .off) { _ in
-                        select(model, of: account)
+                        select(model)
                     }
                 },
             ))
@@ -755,15 +802,6 @@ extension ChatController {
             },
         ))
         return UIMenu(title: menuTitle(of: account), options: .displayInline, children: sections)
-    }
-
-    /// Switches the conversation to `model` of `account`, enabled first so
-    /// the panel goes on offering it.
-    private static func select(_ model: String, of account: AgentAccount) {
-        if !EnabledModels.isEnabled(model, in: account) {
-            EnabledModels.setEnabled(true, model, in: account)
-        }
-        ComposerModelSelection.current = selection(of: model, in: account)
     }
 
     /// Every provider's catalog at once: one that does not answer is absent
@@ -805,20 +843,26 @@ extension ChatController {
     /// still enabled takes the catalog's efforts and tiers again. A
     /// signed-in account whose sign-in did not read this time lists no
     /// models; its model is kept rather than swapped for another's.
+    ///
+    /// A conversation that picked a model is repaired on its own; one that
+    /// follows the app's default repairs the default, which every such
+    /// conversation shows.
     @objc dynamic func ensureModelSelection() {
         selectionCheck?.cancel()
-        selectionCheck = Task {
+        selectionCheck = Task { [weak self] in
+            guard let self, let chat = self.chat else { return }
             guard let listed = try? await ApelinService.app.agentAccountList().accounts,
-                  !Task.isCancelled
+                  !Task.isCancelled, self.chat?.id == chat.id
             else { return }
             let accounts = EnabledModels.accounts(from: listed)
-            if let current = ComposerModelSelection.current {
+            let own = self.runtime.records[chat.id]?.hasOwnSelection == true
+            if let current = self.runtime.records[chat.id]?.selection ?? ComposerModelSelection.current {
                 if let account = accounts.first(where: { account in
                     account.provider == current.provider && (account.models ?? []).contains(current.model)
                 }) {
                     let refreshed = Self.selection(of: current.model, in: account)
                     if refreshed != current {
-                        ComposerModelSelection.current = refreshed
+                        self.take(refreshed, for: chat.id, own: own)
                     }
                     return
                 }
@@ -827,7 +871,17 @@ extension ChatController {
                 }
             }
             guard let account = accounts.first, let model = account.models?.first else { return }
-            ComposerModelSelection.current = Self.selection(of: model, in: account)
+            self.take(Self.selection(of: model, in: account), for: chat.id, own: own)
+        }
+    }
+
+    /// Writes a repaired pick where the conversation reads it: its own
+    /// record, or the default it follows.
+    private func take(_ selection: ComposerModelSelection, for id: UUID, own: Bool) {
+        if own {
+            runtime.takeSelection(selection, for: id)
+        } else {
+            ComposerModelSelection.current = selection
         }
     }
 
