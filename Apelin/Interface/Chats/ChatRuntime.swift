@@ -806,3 +806,43 @@ private extension DataFolder {
         try FileManager.default.removeItem(at: folder)
     }
 }
+
+extension ChatRecord {
+    /// Whether this conversation picked a model of its own rather than
+    /// following the app's default.
+    var hasOwnSelection: Bool {
+        provider != nil && model != nil
+    }
+
+    /// What this conversation sends with: its own pick, or else the app's
+    /// current default.
+    var selection: ComposerModelSelection? {
+        guard let provider = provider, let model = model else { return ComposerModelSelection.current }
+        return ComposerModelSelection(
+            provider: provider,
+            model: model,
+            supportedEfforts: supportedEfforts ?? [],
+            supportedTiers: supportedTiers,
+        )
+    }
+
+    /// Keeps `selection` as this conversation's own, replacing the one it
+    /// had, catalog snapshot and all.
+    mutating func takeSelection(_ selection: ComposerModelSelection) {
+        provider = selection.provider
+        model = selection.model
+        supportedEfforts = selection.supportedEfforts
+        supportedTiers = selection.supportedTiers
+    }
+
+    /// Takes the app's default as this conversation's own, unless it has one
+    /// already: what opening or sending the first time does, so a default
+    /// changed later leaves this conversation as it was. Returns whether it
+    /// took one.
+    @discardableResult
+    mutating func pinSelection(_ selection: ComposerModelSelection?) -> Bool {
+        guard !hasOwnSelection, let selection else { return false }
+        takeSelection(selection)
+        return true
+    }
+}
