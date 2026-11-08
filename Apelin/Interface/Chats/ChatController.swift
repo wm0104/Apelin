@@ -647,14 +647,20 @@ final class ChatController: UIViewController {
         }
     }
 
-    /// The menu re-reads enabled accounts each time, including after setup.
+    /// The menu re-reads every signed-in account each time, including after
+    /// setup: the models its panel offers are what the reader switches
+    /// between, and the rest of its catalog is what they turn on without
+    /// leaving the menu. A provider that does not answer with its catalog
+    /// still offers what is enabled, and one line saying the rest is not
+    /// available.
     @objc dynamic private func loadModelMenu(completion: @escaping ([UIMenuElement]) -> Void) {
         guard let chat else { completion([]); return }
         modelLoader?.cancel()
         modelLoader = Task { [weak self] in
             guard let self else { completion([]); return }
             do {
-                let accounts = try await EnabledModels.accounts(from: ApelinService.app.agentAccountList().accounts)
+                let listed = try await ApelinService.app.agentAccountList().accounts
+                let accounts = listed.filter(\.signedIn)
                 guard !Task.isCancelled, self.chat?.id == chat.id else { completion([]); return }
                 guard !accounts.isEmpty else {
                     completion([])
@@ -664,16 +670,13 @@ final class ChatController: UIViewController {
                     }
                     return
                 }
+                let catalogs = await Self.catalogs(for: accounts.map(\.provider))
+                guard !Task.isCancelled, self.chat?.id == chat.id else { completion([]); return }
                 let selected = ComposerModelSelection.current
-                completion(accounts.map { account in
-                    UIMenu(title: account.account ?? account.provider.displayName, options: .displayInline,
-                           children: (account.models ?? []).map { model in
-                               let checked = account.provider == selected?.provider && model == selected?.model
-                               return UIAction(title: model, state: checked ? .on : .off) { _ in
-                                   ComposerModelSelection.current = Self.selection(of: model, in: account)
-                               }
-                           })
-                })
+                let menus: [UIMenuElement] = accounts.map { account in
+                    Self.accountMenu(account, selected: selected, catalog: catalogs[account.provider])
+                }
+                completion(menus)
             } catch {
                 completion([])
                 guard !Task.isCancelled, self.chat?.id == chat.id else { return }
@@ -694,6 +697,105 @@ extension ChatController {
             supportedEfforts: (account.reasoningEfforts?[model] ?? []).filter { [.low, .high, .max].contains($0) },
             supportedTiers: account.serviceTiers?[model] ?? [],
         )
+    }
+
+    /// What an account's group is called in the menu: the endpoint a key
+    /// names, else the provider's own name.
+    private static func menuTitle(of account: AgentAccount) -> String {
+        account.account ?? account.provider.displayName
+    }
+
+    /// One account's models, in two sections: the ones its panel offers,
+    /// which switch the conversation, and its whole catalog, which turns
+    /// them on and off without closing the menu. The model in use cannot be
+    /// turned off there, so the conversation never runs one the panel does
+    /// not offer.
+    private static func accountMenu(
+        _ account: AgentAccount,
+        selected: ComposerModelSelection?,
+        catalog: [String]?,
+    ) -> UIMenu {
+        let enabled = EnabledModels.enabled(in: account)
+        let inUse = account.provider == selected?.provider ? selected?.model : nil
+        var sections: [UIMenuElement] = []
+        if !enabled.isEmpty {
+            sections.append(UIMenu(
+                title: String(localized: "In Use"),
+                options: .displayInline,
+                children: enabled.map { model in
+                    UIAction(title: model, state: model == inUse ? .on : .off) { _ in
+                        select(model, of: account)
+                    }
+                },
+            ))
+        }
+        guard let catalog else {
+            sections.append(UIAction(
+                title: String(localized: "Models Unavailable"),
+                attributes: [.disabled],
+                handler: { _ in },
+            ))
+            return UIMenu(title: menuTitle(of: account), options: .displayInline, children: sections)
+        }
+        sections.append(UIMenu(
+            title: String(localized: "Enable Models"),
+            options: .displayInline,
+            children: catalog.map { model in
+                let isOn = enabled.contains(model)
+                let action = UIAction(title: model, state: isOn ? .on : .off) { _ in
+                    EnabledModels.setEnabled(!isOn, model, in: account)
+                }
+                // The menu stays up while models are turned on and off, and
+                // the one in use stays on.
+                action.keepsMenuPresented = true
+                action.attributes = model == inUse ? [.disabled] : []
+                return action
+            },
+        ))
+        return UIMenu(title: menuTitle(of: account), options: .displayInline, children: sections)
+    }
+
+    /// Switches the conversation to `model` of `account`, enabled first so
+    /// the panel goes on offering it.
+    private static func select(_ model: String, of account: AgentAccount) {
+        if !EnabledModels.isEnabled(model, in: account) {
+            EnabledModels.setEnabled(true, model, in: account)
+        }
+        ComposerModelSelection.current = selection(of: model, in: account)
+    }
+
+    /// Every provider's catalog at once: one that does not answer is absent
+    /// from the answer, and its group offers only what is enabled.
+    private static func catalogs(for providers: [AgentProvider]) async -> [AgentProvider: [String]] {
+        await withTaskGroup(of: (AgentProvider, [String]?).self) { group in
+            for provider in providers {
+                group.addTask { (provider, await Self.catalog(for: provider)) }
+            }
+            var found: [AgentProvider: [String]] = [:]
+            for await (provider, models) in group {
+                if let models, !models.isEmpty {
+                    found[provider] = models
+                }
+            }
+            return found
+        }
+    }
+
+    /// The models `provider` lists, or nil when it did not answer in time:
+    /// a menu is not worth waiting on for longer.
+    private static func catalog(for provider: AgentProvider, within seconds: Double = 10) async -> [String]? {
+        await withTaskGroup(of: [String]?.self) { group in
+            group.addTask {
+                (try? await ApelinService.app.agentModelList(provider: provider))?.models
+            }
+            group.addTask {
+                _ = try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                return nil
+            }
+            defer { group.cancelAll() }
+            let first = await group.next()
+            return first ?? nil
+        }
     }
 
     /// With no model picked, or one no longer enabled, the first enabled

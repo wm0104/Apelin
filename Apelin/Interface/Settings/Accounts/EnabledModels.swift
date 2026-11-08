@@ -37,13 +37,51 @@ enum EnabledModels {
         Set(UserDefaults.standard.stringArray(forKey: "hiddenModels.\(provider.rawValue)") ?? [])
     }
 
+    /// The models of `account` the reader has enabled, as the chat panel
+    /// offers them: an API-key account's are the ids it enabled, a
+    /// subscription's are the ones its catalog lists and the reader enabled.
+    static func enabled(in account: AgentAccount) -> [String] {
+        let ids = ids(for: account.provider).subtracting(hiddenIDs(for: account.provider))
+        return account.isAPIKeyAccount
+            ? ids.sorted()
+            : (account.models ?? []).filter { ids.contains($0) }
+    }
+
+    /// Whether the chat panel offers `model` of `account`.
+    static func isEnabled(_ model: String, in account: AgentAccount) -> Bool {
+        ids(for: account.provider).subtracting(hiddenIDs(for: account.provider)).contains(model)
+    }
+
+    /// Turns `model` of `account` on or off without touching any other id,
+    /// the custom ids or the hidden ones; a model turned back on stops being
+    /// hidden. Answers whether it is enabled now.
+    @discardableResult
+    static func setEnabled(_ enabled: Bool, _ model: String, in account: AgentAccount) -> Bool {
+        var ids = ids(for: account.provider)
+        var hidden = hiddenIDs(for: account.provider)
+        if enabled {
+            ids.insert(model)
+            hidden.remove(model)
+        } else {
+            ids.remove(model)
+        }
+        save(
+            ids,
+            custom: Set(customIDs(for: account.provider)),
+            hidden: hidden,
+            for: account.provider,
+        )
+        return enabled
+    }
+
     static func accounts(from accounts: [AgentAccount]) -> [AgentAccount] {
         accounts.compactMap { account in
             guard account.signedIn else { return nil }
-            var enabled = account
-            let ids = ids(for: account.provider).subtracting(hiddenIDs(for: account.provider))
-            enabled.models = account.isAPIKeyAccount ? ids.sorted() : (account.models ?? []).filter { ids.contains($0) }
-            return enabled.models?.isEmpty == false ? enabled : nil
+            let models = enabled(in: account)
+            guard !models.isEmpty else { return nil }
+            var shown = account
+            shown.models = models
+            return shown
         }
     }
 }
