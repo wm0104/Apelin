@@ -134,6 +134,7 @@ jobs:
                   obj = api(f"{prefix}/git/tags/{obj['sha']}")['object']
               if obj['type'] != 'commit' or obj['sha'] != sha:
                   raise SystemExit('error: existing tag points elsewhere; nothing overwritten')
+              return True
 
           verify_tag()
           artifacts = api(f'{prefix}/actions/runs/{run_id}/artifacts?per_page=100')
@@ -174,7 +175,10 @@ jobs:
                   raise SystemExit('error: DEB contains an Irisin/Fila hard dependency')
               checksum = 'sha256:' + hashlib.file_digest(deb.open('rb'), 'sha256').hexdigest()
               # Stage privately; only make it public after the uploaded bytes match.
-              release = api(f'{prefix}/releases', {'tag_name': tag, 'target_commitish': sha, 'name': title, 'body': '', 'draft': True, 'prerelease': False, 'generate_release_notes': False, 'make_latest': 'false'}, method='POST')
+              parameters = {'tag_name': tag, 'name': title, 'body': '', 'draft': True, 'prerelease': False, 'generate_release_notes': False, 'make_latest': 'false'}
+              if not verify_tag():
+                  parameters['target_commitish'] = sha
+              release = api(f'{prefix}/releases', parameters, method='POST')
               rid = release['id']
               upload_url = release['upload_url'].split('{')[0] + '?name=' + name
               uploaded = json.loads(subprocess.check_output(['gh', 'api', upload_url, '--method', 'POST', '-H', 'Content-Type: application/vnd.debian.binary-package', '--input', str(deb)], text=True))
