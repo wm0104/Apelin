@@ -1,0 +1,77 @@
+# Called by this branch's registered CI entry point; never builds packages.
+name: Sync upstream
+
+on:
+  workflow_call:
+    outputs:
+      sha:
+        description: Exact synchronized commit to test and build
+        value: ${{ jobs.sync.outputs.sha }}
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'wm0104/Apelin' && github.ref == 'refs/heads/build/apelin-fila-optional'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.merge.outputs.sha }}
+    steps:
+      - name: Check out the requested commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Merge upstream and preserve optional dependencies
+        id: merge
+        shell: bash
+        env:
+          DISPATCH_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          branch=refs/heads/build/apelin-fila-optional
+          remote=https://github.com/wm0104/Apelin.git
+          git fetch --no-tags "$remote" "$branch"
+          base="$(git rev-parse FETCH_HEAD)"
+          if [[ "$base" != "$DISPATCH_SHA" || "$(git rev-parse HEAD)" != "$base" ]]; then
+            echo "error: optional branch changed since dispatch; run again manually" >&2
+            exit 1
+          fi
+          git fetch --no-tags https://github.com/owngoal-dev/Apelin.git refs/heads/main
+          upstream="$(git rev-parse FETCH_HEAD)"
+          git config user.name Codex
+          git config user.email noreply@openai.com
+          export GIT_AUTHOR_NAME=Codex GIT_AUTHOR_EMAIL=noreply@openai.com
+          export GIT_COMMITTER_NAME=Codex GIT_COMMITTER_EMAIL=noreply@openai.com
+          # Conflicts stop here; neither side is silently discarded.
+          git merge --no-ff --no-commit "$upstream"
+          python3 - <<'PY'
+          import pathlib, re
+          text = pathlib.Path('Packaging/DEBIAN/control').read_text()
+          text = re.sub(r'\n[ \t]+', ' ', text)
+          for name, value in re.findall(r'^([^:\n]+):[^\S\n]*(.*)$', text, re.M):
+              if name.lower() in ('depends', 'pre-depends'):
+                  if re.search(r'(?<![a-z0-9+.-])wiki\.qaq\.(?:irisin|fila)(?![a-z0-9+.-])', value):
+                      raise SystemExit('error: upstream restored an Irisin/Fila hard dependency; nothing pushed')
+          PY
+          if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            git commit -m "同步上游最新源码并保留可选依赖"
+          fi
+          head="$(git rev-parse HEAD)"
+          current="$(git ls-remote --exit-code "$remote" "$branch")"
+          read -r current_sha current_ref <<< "$current"
+          if [[ "$current_sha" != "$base" || "$current_ref" != "$branch" ]]; then
+            echo "error: optional branch changed during sync; nothing pushed" >&2
+            exit 1
+          fi
+          git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push "$remote" "HEAD:$branch"
+          printf 'sha=%s\n' "$head" >> "$GITHUB_OUTPUT"
+          printf 'Optional base: %s\nUpstream main: %s\nBuild HEAD: %s\n' "$base" "$upstream" "$head"
+          printf '### Synchronized source\n\nBase: `%s`\n\nUpstream: `%s`\n\nBuild HEAD: `%s`\n' "$base" "$upstream" "$head" >> "$GITHUB_STEP_SUMMARY"

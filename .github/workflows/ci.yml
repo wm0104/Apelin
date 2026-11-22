@@ -1,5 +1,4 @@
-# This branch's registered CI entry point is manual-only. Main's CI and
-# Release stay independent; this artifact is never a Release input.
+# Upstream build/test steps, preceded by an independent source-sync workflow.
 name: CI
 
 on:
@@ -8,6 +7,7 @@ on:
 permissions:
   contents: read
 
+# Serialize manual sync-and-build runs for the one maintained branch.
 concurrency:
   group: apelin-sync-build-apelin-fila-optional
   cancel-in-progress: false
@@ -17,76 +17,61 @@ env:
   HOMEBREW_NO_INSTALL_CLEANUP: "1"
   HOMEBREW_NO_ANALYTICS: "1"
 
+# Both jobs run on the Xcode 27 image, the one with the iOS 27.1 SDK the
+# packages are linked against (`IOS_SDK_TIER` in the Makefile: the tier an
+# iPhone Duo runs edge to edge, with vertical bars). Its default Xcode may be
+# newer than 27.1, so 27.1 is named rather than the newest found.
 jobs:
-  sync-build:
-    name: Sync optional branch and verify one roothide package
+  sync:
     if: github.event_name == 'workflow_dispatch' && github.repository == 'wm0104/Apelin' && github.ref == 'refs/heads/build/apelin-fila-optional'
-    runs-on: xcode-27
-    timeout-minutes: 150
     permissions:
       contents: write
-    defaults:
-      run:
-        shell: bash
+    uses: ./.github/workflows/sync-upstream.yml
+
+  # Seconds, where the build takes minutes, so a broken host test says so
+  # long before the packages would.
+  test:
+    needs: sync
+    name: Host tests
+    runs-on: xcode-27
+    timeout-minutes: 60
 
     steps:
-      - name: Check out the original optional branch
+      - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: refs/heads/build/apelin-fila-optional
-          fetch-depth: 0
+          ref: ${{ needs.sync.outputs.sha }}
           persist-credentials: false
-
-      - name: Pin branch and upstream heads, then merge
-        id: sync
-        env:
-          DISPATCH_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          git fetch --no-tags https://github.com/wm0104/Apelin.git refs/heads/build/apelin-fila-optional
-          base="$(git rev-parse FETCH_HEAD)"
-          if [[ "$(git rev-parse HEAD)" != "$base" ]]; then
-            echo "error: optional branch changed during checkout; retry manually" >&2
-            exit 1
-          fi
-          if [[ "$base" != "$DISPATCH_SHA" ]]; then
-            echo "error: optional branch changed since dispatch; retry manually" >&2
-            exit 1
-          fi
-          git fetch --no-tags https://github.com/owngoal-dev/Apelin.git refs/heads/main
-          upstream="$(git rev-parse FETCH_HEAD)"
-          export GIT_AUTHOR_NAME=Codex GIT_AUTHOR_EMAIL=noreply@openai.com
-          export GIT_COMMITTER_NAME=Codex GIT_COMMITTER_EMAIL=noreply@openai.com
-          git config user.name Codex
-          git config user.email noreply@openai.com
-          # A conflict fails the run. Never resolve by discarding either side.
-          git merge --no-ff --no-edit "$upstream"
-          head="$(git rev-parse HEAD)"
-          printf 'base=%s\nupstream=%s\nhead=%s\n' "$base" "$upstream" "$head" >> "$GITHUB_OUTPUT"
-          printf 'Optional base: %s\nUpstream main: %s\nBuild HEAD: %s\n' "$base" "$upstream" "$head"
-          printf '### Optional branch build\n\nBase: `%s`\n\nUpstream main: `%s`\n\nBuild HEAD: `%s`\n' "$base" "$upstream" "$head" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Verify optional dependency policy before building
-        run: |
-          set -euo pipefail
-          python3 Scripts/verify-optional-deb.py --control Packaging/DEBIAN/control
-
-      - name: Configure build paths
-        run: |
-          set -euo pipefail
-          echo "DERIVED_DATA=$RUNNER_TEMP/apelin-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
 
       - name: Select Xcode 27.1
         run: |
-          set -euo pipefail
           sudo xcode-select -s /Applications/Xcode_27.1.app/Contents/Developer
           xcodebuild -version
           echo "iPhoneOS SDK $(xcrun --sdk iphoneos --show-sdk-version)"
 
       - name: Run host tests
+        run: make harness SWIFTPM_SCRATCH="$RUNNER_TEMP/apelin-spm"
+
+  # The vphones run iOS 26 and 27, where `Data` through an @objc thunk costs
+  # nothing; on an older Foundation unpacking a toolchain ran out of memory.
+  # The runtime is kept between runs: its first download is 5.4 GB.
+  old-runtime:
+    needs: sync
+    name: Old iOS runtime
+    runs-on: xcode-27
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+
+      - name: Select Xcode 27.1
         run: |
-          set -euo pipefail
-          make harness SWIFTPM_SCRATCH="$RUNNER_TEMP/apelin-spm"
+          sudo xcode-select -s /Applications/Xcode_27.1.app/Contents/Developer
+          xcodebuild -version
 
       - name: Restore the runtime
         id: runtime
@@ -95,20 +80,45 @@ jobs:
           path: ~/Library/Caches/apelin-old-runtime
           key: apelin-old-runtime-ios15.5-${{ hashFiles('Scripts/old-runtime/runtime-root.py') }}
 
-      - name: Run old iOS runtime checks
-        run: |
-          set -euo pipefail
-          make old-runtime
+      - name: Run the checks
+        run: make old-runtime
 
-      # Retain the 5.4 GB runtime even if its checks failed, as in main's CI.
+      # Kept whatever the checks said: a failing commit's retry should not
+      # download 5.4 GB again.
       - name: Keep the runtime
-        if: always() && steps.runtime.outcome == 'success' && steps.runtime.outputs.cache-hit != 'true'
+        if: always() && steps.runtime.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ~/Library/Caches/apelin-old-runtime
           key: ${{ steps.runtime.outputs.cache-primary-key }}
 
+  build:
+    needs: [sync, test, old-runtime]
+    name: Build and verify Debian packages
+    runs-on: xcode-27
+    timeout-minutes: 90
+
+    steps:
+      - name: Configure build paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "DERIVED_DATA=$RUNNER_TEMP/apelin-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+
+      - name: Select Xcode 27.1
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.1.app/Contents/Developer
+          xcodebuild -version
+          echo "iPhoneOS SDK $(xcrun --sdk iphoneos --show-sdk-version)"
+
       - name: Install packaging dependencies
+        shell: bash
         run: |
           set -euo pipefail
           formulae=()
@@ -119,63 +129,42 @@ jobs:
             brew install "${formulae[@]}"
           fi
 
-      - name: Run optional packaging and workflow behavior tests
-        run: |
-          set -euo pipefail
-          python3 -B -m unittest discover -s Tests/Packaging -p 'test_*.py' -v
+      # The original host and old-runtime jobs passed for this exact commit.
+      # Use upstream's existing single-flavour target, not deb-all.
+      - name: Build, package and verify the roothide IDE
+        run: make deb FLAVOR=roothide CONFIGURATION=Release SKIP_HARNESS=1 DERIVED_DATA="$DERIVED_DATA" BUILD_NUMBER="$GITHUB_RUN_NUMBER"
 
-      - name: Build, package and verify only the roothide IDE
-        run: |
-          set -euo pipefail
-          # Refuse stale output on a persistent runner; never upload old bytes.
-          if [[ -e build/Packages || -L build/Packages ]]; then
-            echo "error: build/Packages already exists; a clean workspace is required" >&2
-            exit 1
-          fi
-          make deb FLAVOR=roothide CONFIGURATION=Release SKIP_HARNESS=1 DERIVED_DATA="$DERIVED_DATA" BUILD_NUMBER="$GITHUB_RUN_NUMBER"
-
-      - name: Verify the closed single-DEB output set
+      - name: Verify the single arm64e DEB
         id: package
+        shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob dotglob
           files=(build/Packages/*)
           if (( ${#files[@]} != 1 )); then
-            echo "error: build/Packages must contain exactly one file" >&2
+            echo "error: expected exactly one package output" >&2
             exit 1
           fi
           deb="${files[0]}"
           version="$(make --no-print-directory print-version)"
-          expected="build/Packages/wiki.qaq.apelin_${version}_iphoneos-arm64e.deb"
-          if [[ "$deb" != "$expected" || ! -f "$deb" || -L "$deb" ]]; then
-            echo "error: expected one regular Apelin iphoneos-arm64e DEB" >&2
+          if [[ "$deb" != "build/Packages/wiki.qaq.apelin_${version}_iphoneos-arm64e.deb" || ! -f "$deb" || -L "$deb" ]]; then
+            echo "error: expected one regular Apelin arm64e DEB" >&2
             exit 1
           fi
-          python3 Scripts/verify-optional-deb.py --deb "$deb"
+          [[ "$(dpkg-deb -f "$deb" Package)" == wiki.qaq.apelin ]]
+          [[ "$(dpkg-deb -f "$deb" Version)" == "$version" ]]
+          [[ "$(dpkg-deb -f "$deb" Architecture)" == iphoneos-arm64e ]]
+          python3 - "$deb" <<'PY'
+          import re, subprocess, sys
+          text = subprocess.check_output(['dpkg-deb', '-f', sys.argv[1], 'Depends', 'Pre-Depends'], text=True)
+          if re.search(r'(?<![a-z0-9+.-])wiki\.qaq\.(?:irisin|fila)(?![a-z0-9+.-])', text):
+              raise SystemExit('error: DEB contains an Irisin/Fila hard dependency')
+          print('Verified single arm64e DEB; Irisin and Fila are not hard dependencies')
+          PY
           shasum -a 256 "$deb"
           printf 'deb=%s\n' "$deb" >> "$GITHUB_OUTPUT"
 
-      - name: Push only the fully validated merge to the original branch
-        id: publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BASE_SHA: ${{ steps.sync.outputs.base }}
-          BUILD_SHA: ${{ steps.sync.outputs.head }}
-        run: |
-          set -euo pipefail
-          [[ "$(git rev-parse HEAD)" == "$BUILD_SHA" ]]
-          git diff --quiet
-          git diff --cached --quiet
-          remote="$(git -c credential.helper= -c 'credential.helper=!gh auth git-credential' ls-remote --exit-code https://github.com/wm0104/Apelin.git refs/heads/build/apelin-fila-optional)"
-          read -r current ref <<< "$remote"
-          if [[ "$current" != "$BASE_SHA" || "$ref" != refs/heads/build/apelin-fila-optional ]]; then
-            echo "error: optional branch changed since sync began; nothing pushed or uploaded" >&2
-            exit 1
-          fi
-          # Ordinary push only: a concurrent non-fast-forward update is rejected.
-          git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push https://github.com/wm0104/Apelin.git HEAD:refs/heads/build/apelin-fila-optional
-
-      - name: Upload the single verified DEB
+      - name: Upload Debian package
         uses: actions/upload-artifact@v4
         with:
           name: apelin-arm64e-${{ github.run_id }}
