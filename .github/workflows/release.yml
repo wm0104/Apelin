@@ -74,7 +74,7 @@ jobs:
               if result.returncode:
                   if missing and 'HTTP 404' in result.stderr:
                       return None
-                  raise SystemExit('error: GitHub request failed: ' + result.stderr.strip())
+                  raise SystemExit(f"error: GitHub {method or 'GET'} {path} failed: {result.stderr.strip()}")
               return json.loads(result.stdout)
 
           run = api(f'{prefix}/actions/runs/{run_id}')
