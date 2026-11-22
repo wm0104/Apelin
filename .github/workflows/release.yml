@@ -100,7 +100,7 @@ jobs:
               for step in steps:
                   if not any(s['name'] == step and s['conclusion'] == 'success' for s in matches[0]['steps']):
                       raise SystemExit('error: missing successful CI step: ' + step)
-          sync_log = subprocess.check_output(['gh', 'api', f"{prefix}/actions/jobs/{chosen['sync / sync']['id']}/logs"], text=True)
+          sync_log = subprocess.check_output(['gh', 'api', f"{prefix}/actions/jobs/{chosen['sync / sync']['id']}/logs", '--allow-escape-sequences'], text=True)
           if re.findall(r'Build HEAD: ([0-9a-f]{40})', sync_log) != [sha]:
               raise SystemExit('error: requested SHA differs from the synchronized build')
           source = api(f'{prefix}/contents/Configuration/Version.xcconfig?ref={sha}')
@@ -150,7 +150,7 @@ jobs:
               root = pathlib.Path(scratch)
               archive = root / 'artifact.zip'
               with archive.open('wb') as out:
-                  subprocess.run(['gh', 'api', f"{prefix}/actions/artifacts/{artifact['id']}/zip"], stdout=out, check=True)
+                  subprocess.run(['gh', 'api', f"{prefix}/actions/artifacts/{artifact['id']}/zip", '--allow-escape-sequences'], stdout=out, check=True)
               digest = 'sha256:' + hashlib.file_digest(archive.open('rb'), 'sha256').hexdigest()
               if archive.stat().st_size != artifact['size_in_bytes'] or digest != artifact['digest']:
                   raise SystemExit('error: downloaded artifact size or SHA256 differs')
