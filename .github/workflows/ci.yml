@@ -94,6 +94,8 @@ jobs:
 
   build:
     needs: [sync, test, old-runtime]
+    outputs:
+      attempt: ${{ steps.package.outputs.attempt }}
     name: Build and verify Debian packages
     runs-on: xcode-27
     timeout-minutes: 90
@@ -163,6 +165,7 @@ jobs:
           PY
           shasum -a 256 "$deb"
           printf 'deb=%s\n' "$deb" >> "$GITHUB_OUTPUT"
+          printf 'attempt=%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
       - name: Upload Debian package
         uses: actions/upload-artifact@v4
@@ -172,3 +175,14 @@ jobs:
           path: ${{ steps.package.outputs.deb }}
           if-no-files-found: error
           retention-days: 30
+
+  publish:
+    needs: [sync, test, old-runtime, build]
+    permissions:
+      contents: write
+      actions: read
+    uses: ./.github/workflows/release.yml
+    with:
+      run_id: ${{ format('{0}', github.run_id) }}
+      source_sha: ${{ needs.sync.outputs.sha }}
+      source_attempt: ${{ needs.build.outputs.attempt }}

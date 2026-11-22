@@ -1,141 +1,197 @@
-# Tag vX.Y.Z → the packages CI built for the tagged commit, published.
-#
-# Nothing is tested or compiled here. The push of the commit to main ran
-# `ci.yml`: the host tests in one job and, beside them, the IDE's two
-# packages and every extension's compiled, packaged and verified in
-# another, kept as the artifact `apelin-<sha>`. The tag publishes that artifact, and only once that run
-# has succeeded: a failed test fails the run, and the release with it. What
-# ships is the file CI verified, not a second build of the same commit.
-#
-# The commit says its version (`make set-version`, the release notes, then
-# the tag), and the IDE's packages CI built are named for it: when they are
-# not named for the tag, nothing is published. Each extension keeps its own
-# id and version; the release carries exactly one roothide and one rootless
-# deb of each, and the assembler's corresponding-source archive beside its
-# debs (it is GPL-2.0), or nothing is published.
-#
-# The tag and the branch usually arrive together, so the run may not exist
-# yet when this starts, and it is waited for. A commit that never reached
-# main has no run: dispatch CI on the tag (`gh workflow run ci.yml
-# --ref vX.Y.Z`), which is also the way back once the artifact is past its
-# thirty days, and re-run this.
-
-name: Release
+# Publish exactly the single DEB already verified by CI; never compile here.
+name: Publish DEB
 
 on:
-  push:
-    tags: ["v[0-9]*.[0-9]*.[0-9]*"]
   workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful CI run whose package should be published
+        required: true
+        type: string
+      source_sha:
+        description: Exact synchronized commit CI built
+        required: true
+        type: string
+      source_attempt:
+        description: CI attempt that uploaded the package
+        required: true
+        default: '1'
+        type: string
+  workflow_call:
+    inputs:
+      run_id:
+        required: true
+        type: string
+      source_sha:
+        required: true
+        type: string
+      source_attempt:
+        required: true
+        type: string
+
+permissions:
+  contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: apelin-publish-release
   cancel-in-progress: false
 
 jobs:
   publish:
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'wm0104/Apelin' && github.ref == 'refs/heads/build/apelin-fila-optional'
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 15
     permissions:
       contents: write
       actions: read
     steps:
-      - uses: actions/checkout@v4
-      # The newest run on the commit that a push or a dispatch started; a pull
-      # request's run names its packages for the merge commit, not this one.
-      - name: Wait for CI on the tagged commit
-        id: ci
+      - name: Verify CI package and publish the upstream version
+        id: publish
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ inputs.run_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_ATTEMPT: ${{ inputs.source_attempt }}
         run: |
           set -euo pipefail
-          run=""
-          for _ in $(seq 30); do
-            run="$(gh run list --workflow ci.yml --commit "$GITHUB_SHA" --json databaseId,event \
-              --jq '[.[] | select(.event != "pull_request")][0].databaseId // empty')"
-            [ -n "$run" ] && break
-            sleep 20
-          done
-          if [ -z "$run" ]; then
-            echo "::error::CI has not run on $GITHUB_SHA: dispatch it on $GITHUB_REF_NAME, then re-run this"
-            exit 1
-          fi
-          echo "CI run $run on $GITHUB_SHA"
-          gh run watch "$run" --interval 30 > /dev/null
-          conclusion="$(gh run view "$run" --json conclusion --jq .conclusion)"
-          if [ "$conclusion" != success ]; then
-            echo "::error::CI run $run ended $conclusion: nothing is published"
-            exit 1
-          fi
-          echo "run=$run" >> "$GITHUB_OUTPUT"
-      - uses: actions/download-artifact@v4
-        with:
-          name: apelin-${{ github.sha }}
-          path: build/Packages/
-          run-id: ${{ steps.ci.outputs.run }}
-          github-token: ${{ github.token }}
-      # CI's list proves the transfer. The release's own list is written for
-      # exactly the files it carries (the IDE's named for the tag, each
-      # extension's for its own version), and a missing one fails here.
-      - name: Verify the packages and write the release checksums
-        working-directory: build/Packages
-        run: |
-          set -euo pipefail
-          sha256sum --check SHA256SUMS
-          version="${GITHUB_REF_NAME#v}"
-          # one <glob>: the single file matching it, or an error.
-          one() {
-            local matches=($1)
-            if [ "${#matches[@]}" -ne 1 ] || [ ! -f "${matches[0]}" ]; then
-              echo "::error::expected exactly one $1 in CI's packages, found: ${matches[*]}" >&2
-              exit 1
-            fi
-            echo "${matches[0]}"
-          }
-          files=("wiki.qaq.apelin_${version}_iphoneos-arm64e.deb"
-                 "wiki.qaq.apelin_${version}_iphoneos-arm64.deb")
-          for id in wiki.qaq.apelin.dev.app wiki.qaq.apelin.dev.tweak \
-                    wiki.qaq.apelin.dev.cli wiki.qaq.apelin.dev.preferences \
-                    wiki.qaq.apelin.agent-tools.disassembler wiki.qaq.apelin.agent-tools.assembler; do
-            for architecture in iphoneos-arm64e iphoneos-arm64; do
-              files+=("$(one "${id}_*_${architecture}.deb")")
-            done
-          done
-          # The assembler's corresponding source, for the version its debs carry.
-          assembler="$(one "wiki.qaq.apelin.agent-tools.assembler_*_iphoneos-arm64.deb")"
-          assembler_version="${assembler#wiki.qaq.apelin.agent-tools.assembler_}"
-          assembler_version="${assembler_version%_iphoneos-arm64.deb}"
-          files+=("$(one "wiki.qaq.apelin.agent-tools.assembler_${assembler_version}_source.tar.xz")")
-          files+=("Apelin_${version}_dSYMs.zip" "Apelin_${version}_Templates.tar.zst")
-          for file in "${files[@]}"; do
-            [ -f "$file" ] || { echo "::error::$file is missing from CI's packages"; exit 1; }
-          done
-          sha256sum "${files[@]}" > SHA256SUMS
-          cat SHA256SUMS
-          # The publish step uploads this list, the IDE's debs first.
-          printf 'build/Packages/%s\n' "${files[@]}" SHA256SUMS > "$RUNNER_TEMP/apelin-release-files"
-      - name: Publish release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          notes="$RUNNER_TEMP/apelin-release.md"
-          if [ -f "Documents/Releases/$version.md" ]; then
-            cp "Documents/Releases/$version.md" "$notes"
-          else
-            cat > "$notes" <<NOTES
-          Apelin $version, for roothide and for rootless (/var/jb) bootstraps,
-          with its development and agent tool extensions.
+          python3 - <<'PY'
+          import base64, datetime, hashlib, json, os, pathlib, re, shutil, stat, subprocess, tempfile, zipfile
 
-          SHA-256 sums are in \`SHA256SUMS\`.
-          NOTES
-          fi
-          mapfile -t files < "$RUNNER_TEMP/apelin-release-files"
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" --clobber "${files[@]}"
-            gh release edit "$GITHUB_REF_NAME" --notes-file "$notes"
-          else
-            gh release create "$GITHUB_REF_NAME" --verify-tag \
-              --title "Apelin $version" --notes-file "$notes" "${files[@]}"
-          fi
+          repo = 'wm0104/Apelin'
+          prefix = f'repos/{repo}'
+          run_id, sha, attempt = (os.environ[k] for k in ('SOURCE_RUN', 'SOURCE_SHA', 'SOURCE_ATTEMPT'))
+          if not (re.fullmatch(r'[1-9][0-9]*', run_id) and re.fullmatch(r'[0-9a-f]{40}', sha) and re.fullmatch(r'[1-9][0-9]*', attempt)):
+              raise SystemExit('error: invalid CI run, attempt or source SHA')
+
+          def api(path, data=None, method=None, missing=False):
+              command = ['gh', 'api', path]
+              if method:
+                  command += ['--method', method]
+              if data is not None:
+                  command += ['--input', '-']
+              result = subprocess.run(command, input=json.dumps(data) if data is not None else None, capture_output=True, text=True)
+              if result.returncode:
+                  if missing and 'HTTP 404' in result.stderr:
+                      return None
+                  raise SystemExit('error: GitHub request failed: ' + result.stderr.strip())
+              return json.loads(result.stdout)
+
+          run = api(f'{prefix}/actions/runs/{run_id}')
+          if not (run['path'] == '.github/workflows/ci.yml' and run['event'] == 'workflow_dispatch' and run['head_branch'] == 'build/apelin-fila-optional' and run['run_attempt'] == int(attempt)):
+              raise SystemExit('error: source must be the requested attempt of this branch CI')
+          # In the automatic call, the four prerequisite jobs passed but CI
+          # itself is still running this publish job. A separate run must be green.
+          if run_id != os.environ['GITHUB_RUN_ID'] and not (run['status'] == 'completed' and run['conclusion'] == 'success'):
+              raise SystemExit('error: the source CI run did not succeed')
+          jobs = api(f'{prefix}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100')['jobs']
+          required = {
+              'sync / sync': ['Merge upstream and preserve optional dependencies'],
+              'Host tests': ['Run host tests'],
+              'Old iOS runtime': ['Run the checks'],
+              'Build and verify Debian packages': ['Build, package and verify the roothide IDE', 'Verify the single arm64e DEB', 'Upload Debian package'],
+          }
+          chosen = {}
+          for name, steps in required.items():
+              matches = [job for job in jobs if job['name'] == name]
+              if len(matches) != 1 or matches[0]['conclusion'] != 'success':
+                  raise SystemExit('error: missing successful prerequisite: ' + name)
+              chosen[name] = matches[0]
+              for step in steps:
+                  if not any(s['name'] == step and s['conclusion'] == 'success' for s in matches[0]['steps']):
+                      raise SystemExit('error: missing successful CI step: ' + step)
+          sync_log = subprocess.check_output(['gh', 'api', f"{prefix}/actions/jobs/{chosen['sync / sync']['id']}/logs"], text=True)
+          if re.findall(r'Build HEAD: ([0-9a-f]{40})', sync_log) != [sha]:
+              raise SystemExit('error: requested SHA differs from the synchronized build')
+          source = api(f'{prefix}/contents/Configuration/Version.xcconfig?ref={sha}')
+          config = base64.b64decode(source['content']).decode()
+          match = re.search(r'^MARKETING_VERSION\s*=\s*([0-9]+\.[0-9]+\.[0-9]+)\s*$', config, re.M)
+          if not match:
+              raise SystemExit('error: source version must follow upstream X.Y.Z naming')
+          version = match[1]
+          tag, title = 'v' + version, 'Apelin ' + version
+          existing = api(f'{prefix}/releases/tags/{tag}', missing=True)
+          if existing:
+              if existing['draft']:
+                  raise SystemExit('error: an existing draft needs review; nothing overwritten')
+              print('Already published; retaining release and tag: ' + existing['html_url'])
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+                  out.write('url=' + existing['html_url'] + '\n')
+              raise SystemExit(0)
+
+          def verify_tag(required=False):
+              ref = api(f'{prefix}/git/ref/tags/{tag}', missing=True)
+              if ref is None:
+                  if required:
+                      raise SystemExit('error: published release tag is missing')
+                  return
+              obj = ref['object']
+              for _ in range(8):
+                  if obj['type'] == 'commit':
+                      break
+                  if obj['type'] != 'tag':
+                      raise SystemExit('error: unexpected tag object')
+                  obj = api(f"{prefix}/git/tags/{obj['sha']}")['object']
+              if obj['type'] != 'commit' or obj['sha'] != sha:
+                  raise SystemExit('error: existing tag points elsewhere; nothing overwritten')
+
+          verify_tag()
+          artifacts = api(f'{prefix}/actions/runs/{run_id}/artifacts?per_page=100')
+          if artifacts['total_count'] != 1 or len(artifacts['artifacts']) != 1:
+              raise SystemExit('error: expected exactly one CI artifact')
+          artifact = artifacts['artifacts'][0]
+          if artifact['name'] != f'apelin-arm64e-{run_id}' or artifact['expired'] or artifact['workflow_run']['head_sha'] != run['head_sha']:
+              raise SystemExit('error: wrong or expired CI artifact')
+          build = chosen['Build and verify Debian packages']
+          instant = lambda value: datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
+          if not (instant(build['started_at']) <= instant(artifact['created_at']) <= instant(build['completed_at'])):
+              raise SystemExit('error: artifact is not from the successful build attempt')
+          with tempfile.TemporaryDirectory(prefix='apelin-release-', dir=os.environ['RUNNER_TEMP']) as scratch:
+              root = pathlib.Path(scratch)
+              archive = root / 'artifact.zip'
+              with archive.open('wb') as out:
+                  subprocess.run(['gh', 'api', f"{prefix}/actions/artifacts/{artifact['id']}/zip"], stdout=out, check=True)
+              digest = 'sha256:' + hashlib.file_digest(archive.open('rb'), 'sha256').hexdigest()
+              if archive.stat().st_size != artifact['size_in_bytes'] or digest != artifact['digest']:
+                  raise SystemExit('error: downloaded artifact size or SHA256 differs')
+              name = f'wiki.qaq.apelin_{version}_iphoneos-arm64e.deb'
+              deb = root / name
+              with zipfile.ZipFile(archive) as zipped:
+                  entries = zipped.infolist()
+                  if len(entries) != 1 or entries[0].filename != name or entries[0].is_dir():
+                      raise SystemExit('error: artifact must contain only the expected DEB')
+                  if stat.S_IFMT(entries[0].external_attr >> 16) not in (0, stat.S_IFREG) or not 0 < entries[0].file_size < 1024**3:
+                      raise SystemExit('error: invalid DEB archive entry')
+                  if zipped.testzip() is not None:
+                      raise SystemExit('error: artifact CRC failed')
+                  with zipped.open(entries[0]) as src, deb.open('wb') as dst:
+                      shutil.copyfileobj(src, dst)
+              for field, expected in [('Package', 'wiki.qaq.apelin'), ('Version', version), ('Architecture', 'iphoneos-arm64e')]:
+                  if subprocess.check_output(['dpkg-deb', '-f', str(deb), field], text=True).strip() != expected:
+                      raise SystemExit('error: DEB ' + field + ' differs from the source')
+              depends = subprocess.check_output(['dpkg-deb', '-f', str(deb), 'Depends', 'Pre-Depends'], text=True)
+              if re.search(r'(?<![a-z0-9+.-])wiki\.qaq\.(?:irisin|fila)(?![a-z0-9+.-])', depends):
+                  raise SystemExit('error: DEB contains an Irisin/Fila hard dependency')
+              checksum = 'sha256:' + hashlib.file_digest(deb.open('rb'), 'sha256').hexdigest()
+              # Stage privately; only make it public after the uploaded bytes match.
+              release = api(f'{prefix}/releases', {'tag_name': tag, 'target_commitish': sha, 'name': title, 'body': '', 'draft': True, 'prerelease': False, 'generate_release_notes': False, 'make_latest': 'false'}, method='POST')
+              rid = release['id']
+              upload_url = release['upload_url'].split('{')[0] + '?name=' + name
+              uploaded = json.loads(subprocess.check_output(['gh', 'api', upload_url, '--method', 'POST', '-H', 'Content-Type: application/vnd.debian.binary-package', '--input', str(deb)], text=True))
+              staged = api(f'{prefix}/releases/{rid}')
+              if not staged['draft'] or len(staged['assets']) != 1:
+                  raise SystemExit('error: draft contains unexpected assets; not published')
+              asset = staged['assets'][0]
+              if not (asset['id'] == uploaded['id'] and asset['name'] == name and asset['state'] == 'uploaded' and asset['size'] == deb.stat().st_size and asset['digest'] == checksum):
+                  raise SystemExit('error: uploaded asset differs; draft not published')
+              verify_tag()
+              published = api(f'{prefix}/releases/{rid}', {'name': title, 'body': '', 'draft': False, 'prerelease': False, 'make_latest': 'true'}, method='PATCH')
+              verify_tag(required=True)
+              if published['draft'] or published['prerelease'] or published['name'] != title or published.get('body') not in ('', None):
+                  raise SystemExit('error: published release metadata differs')
+              if api(f'{prefix}/releases/latest')['id'] != rid:
+                  raise SystemExit('error: release was not marked Latest')
+              print(f"Published {title}; tag={tag}; source={sha}; DEB={checksum}; {published['html_url']}")
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+                  out.write('url=' + published['html_url'] + '\n')
+          PY
