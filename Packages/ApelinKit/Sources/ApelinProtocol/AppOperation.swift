@@ -56,6 +56,7 @@ public enum AppOperation: String, Codable, CaseIterable, Sendable {
 
     case confirmLoaded
     case confirmLoadedAttach
+    case confirmLoadedCancel
     case captureScreen
     case readUITree
     case uiAction
@@ -117,6 +118,7 @@ public enum AppOperation: String, Codable, CaseIterable, Sendable {
     case distributionRepositoryLink
     case distributionRepositoryUnlink
     case distributionPublish
+    case distributionRelease
     case feedbackSend
     case feedbackRead
     case feedbackEdit
@@ -140,7 +142,7 @@ public enum AppOperation: String, Codable, CaseIterable, Sendable {
         case .fileRead, .protectedEditOpen, .protectedEditCommit: .files
         case .ptyOpen, .ptyAttach, .ptyResize, .ptyClose: .terminal
         case .logStream, .crashList, .crashOpen, .crashSymbolicate: .logs
-        case .confirmLoaded, .confirmLoadedAttach, .captureScreen, .readUITree, .uiAction,
+        case .confirmLoaded, .confirmLoadedAttach, .confirmLoadedCancel, .captureScreen, .readUITree, .uiAction,
              .devicePasscodeState, .devicePasscodeSave, .devicePasscodeRemove:
             .diagnostics
         case .agentOpen, .agentPrompt, .agentSteer, .agentAbort, .agentCompact, .agentApprove, .agentAttach, .agentList,
@@ -157,7 +159,8 @@ public enum AppOperation: String, Codable, CaseIterable, Sendable {
             .git
         case .transferExport, .transferInspect, .transferImport: .transfer
         case .distributionRepositoryList, .distributionRepositoryCreate, .distributionRepositoryLink,
-             .distributionRepositoryUnlink, .distributionPublish, .feedbackSend, .feedbackRead, .feedbackEdit,
+             .distributionRepositoryUnlink, .distributionPublish, .distributionRelease, .feedbackSend, .feedbackRead,
+             .feedbackEdit,
              .feedbackStarState, .feedbackStar:
             .distribution
         }
@@ -204,6 +207,7 @@ public enum AppOperation: String, Codable, CaseIterable, Sendable {
         case .crashSymbolicate: CrashSymbolicateRequest.self
         case .confirmLoaded: ConfirmLoadedRequest.self
         case .confirmLoadedAttach: ConfirmLoadedAttachRequest.self
+        case .confirmLoadedCancel: ConfirmLoadedCancelRequest.self
         case .captureScreen: CaptureScreenRequest.self
         case .readUITree: ReadUITreeRequest.self
         case .uiAction: UIActionRequest.self
@@ -261,6 +265,7 @@ public enum AppOperation: String, Codable, CaseIterable, Sendable {
         case .distributionRepositoryLink: DistributionRepositoryLinkRequest.self
         case .distributionRepositoryUnlink: DistributionRepositoryUnlinkRequest.self
         case .distributionPublish: DistributionPublishRequest.self
+        case .distributionRelease: DistributionReleaseRequest.self
         case .feedbackSend: FeedbackSendRequest.self
         case .feedbackRead: FeedbackReadRequest.self
         case .feedbackEdit: FeedbackEditRequest.self
